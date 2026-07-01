@@ -189,8 +189,40 @@ fate-ts-timed-id3-hls-demux: CMD = ffprobe_demux $(TARGET_PATH)/tests/data/id3.m
 FATE_SAMPLES_DEMUX-$(call PARSERDEM, JPEGXS, IMAGE_JPEGXS_PIPE, CONCAT_PROTOCOL) += fate-jxs-concat-demux
 fate-jxs-concat-demux: CMD = framecrc "-i concat:$(TARGET_SAMPLES)/jxs/lena.jxs|$(TARGET_SAMPLES)/jxs/lena.jxs -c:v copy"
 
+# Crafted SGI Movie files: input-derived sizes used for allocation / indexing
+# must be rejected without hanging or allocating huge buffers.
+tests/data/mv-huge-nb-frames.mv: TAG = GEN
+tests/data/mv-huge-nb-frames.mv: $(SRC_PATH)/tests/gen-mv-invalid.py | tests/data
+	$(M)python3 $(SRC_PATH)/tests/gen-mv-invalid.py huge-nb-frames $@
+
+tests/data/mv-huge-var-size.mv: TAG = GEN
+tests/data/mv-huge-var-size.mv: $(SRC_PATH)/tests/gen-mv-invalid.py | tests/data
+	$(M)python3 $(SRC_PATH)/tests/gen-mv-invalid.py huge-var-size $@
+
+tests/data/mv-huge-packet-size.mv: TAG = GEN
+tests/data/mv-huge-packet-size.mv: $(SRC_PATH)/tests/gen-mv-invalid.py | tests/data
+	$(M)python3 $(SRC_PATH)/tests/gen-mv-invalid.py huge-packet-size $@
+
+# Expect demux to fail cleanly (non-zero exit) on each crafted sample.
+FATE_MV_INVALID-$(CONFIG_MV_DEMUXER) += fate-mv-huge-nb-frames
+fate-mv-huge-nb-frames: tests/data/mv-huge-nb-frames.mv
+fate-mv-huge-nb-frames: CMD = run $(FFMPEG) -nostdin -v error -i $(TARGET_PATH)/tests/data/mv-huge-nb-frames.mv -f null -; test $$? -ne 0
+fate-mv-huge-nb-frames: CMP = null
+
+FATE_MV_INVALID-$(CONFIG_MV_DEMUXER) += fate-mv-huge-var-size
+fate-mv-huge-var-size: tests/data/mv-huge-var-size.mv
+fate-mv-huge-var-size: CMD = run $(FFMPEG) -nostdin -v error -i $(TARGET_PATH)/tests/data/mv-huge-var-size.mv -f null -; test $$? -ne 0
+fate-mv-huge-var-size: CMP = null
+
+FATE_MV_INVALID-$(CONFIG_MV_DEMUXER) += fate-mv-huge-packet-size
+fate-mv-huge-packet-size: tests/data/mv-huge-packet-size.mv
+fate-mv-huge-packet-size: CMD = run $(FFMPEG) -nostdin -v error -i $(TARGET_PATH)/tests/data/mv-huge-packet-size.mv -f null -; test $$? -ne 0
+fate-mv-huge-packet-size: CMP = null
+
+FATE_FFMPEG += $(FATE_MV_INVALID-yes)
+
 FATE_SAMPLES_DEMUX += $(FATE_SAMPLES_DEMUX-yes)
 FATE_SAMPLES_FFMPEG += $(FATE_SAMPLES_DEMUX)
 FATE_FFPROBE_DEMUX   += $(FATE_FFPROBE_DEMUX-yes)
 FATE_SAMPLES_FFPROBE += $(FATE_FFPROBE_DEMUX)
-fate-demux: $(FATE_SAMPLES_DEMUX) $(FATE_FFPROBE_DEMUX)
+fate-demux: $(FATE_SAMPLES_DEMUX) $(FATE_FFPROBE_DEMUX) $(FATE_MV_INVALID-yes)
