@@ -1,0 +1,37 @@
+name: mvdec bounds regression
+
+on:
+  push:
+    branches: [fix/mv-demuxer-size-bounds, master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build-and-fate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential yasm nasm pkg-config python3
+
+      - name: Configure (minimal, MV demuxer only)
+        run: |
+          ./configure \
+            --disable-doc --disable-ffplay --disable-ffprobe \
+            --disable-network --disable-autodetect \
+            --disable-encoders --disable-decoders --disable-muxers \
+            --disable-demuxers --disable-filters --disable-parsers \
+            --disable-bsfs --disable-protocols --disable-indevs --disable-outdevs \
+            --enable-protocol=file --enable-demuxer=mv --enable-decoder=mvc1
+
+      - name: Build ffmpeg (incremental single program)
+        run: make -j"$(nproc)" ffmpeg
+
+      - name: Run crafted-sample FATE regressions
+        run: |
+          make fate-mv-huge-nb-frames \
+               fate-mv-huge-var-size \
+               fate-mv-huge-packet-size
