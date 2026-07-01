@@ -24,8 +24,11 @@
  * Silicon Graphics Movie demuxer
  */
 
+#include <inttypes.h>
+
 #include "libavutil/channel_layout.h"
 #include "libavutil/eval.h"
+#include "libavutil/imgutils.h"
 #include "libavutil/intfloat.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mem.h"
@@ -53,6 +56,15 @@ typedef struct MvContext {
 
 #define AUDIO_FORMAT_SIGNED 401
 
+/* Metadata / table string values are small in real files; cap allocation. */
+#define MV_MAX_VAR_SIZE      (1 << 20)
+/* Each table entry is at least 20 bytes (16 name + 4 size) on the wire. */
+#define MV_MAX_TABLE_ENTRIES (1 << 20)
+/* Index records are 16 bytes each; refuse absurd frame counts early. */
+#define MV_MAX_FRAMES        (1 << 20)
+/* AVIndexEntry.size is a 30-bit field; match ff_add_index_entry. */
+#define MV_MAX_PACKET_SIZE   0x3FFFFFFF
+
 static int mv_probe(const AVProbeData *p)
 {
     if (AV_RB32(p->buf) == MKBETAG('M', 'O', 'V', 'I') &&
@@ -66,7 +78,9 @@ static char *var_read_string(AVIOContext *pb, int size)
     int n;
     char *str;
 
-    if (size < 0 || size == INT_MAX)
+    /* size is input-derived; reject negative, overflow of size+1, and
+     * unreasonably large values before allocating. */
+    if (size < 0 || size >= INT_MAX || size > MV_MAX_VAR_SIZE)
         return NULL;
 
     str = av_malloc(size + 1);
@@ -151,7 +165,10 @@ static int parse_audio_var(AVFormatContext *avctx, AVStream *st,
     MvContext *mv = avctx->priv_data;
     AVIOContext *pb = avctx->pb;
     if (!strcmp(name, "__DIR_COUNT")) {
-        st->nb_frames = var_read_int(pb, size);
+        int nb_frames = var_read_int(pb, size);
+        if (nb_frames <= 0 || nb_frames > MV_MAX_FRAMES)
+            return AVERROR_INVALIDDATA;
+        st->nb_frames = nb_frames;
     } else if (!strcmp(name, "AUDIO_FORMAT")) {
         mv->aformat = var_read_int(pb, size);
     } else if (!strcmp(name, "COMPRESSION")) {
@@ -186,7 +203,10 @@ static int parse_video_var(AVFormatContext *avctx, AVStream *st,
 {
     AVIOContext *pb = avctx->pb;
     if (!strcmp(name, "__DIR_COUNT")) {
-        st->nb_frames = st->duration = var_read_int(pb, size);
+        int nb_frames = var_read_int(pb, size);
+        if (nb_frames <= 0 || nb_frames > MV_MAX_FRAMES)
+            return AVERROR_INVALIDDATA;
+        st->nb_frames = st->duration = nb_frames;
     } else if (!strcmp(name, "COMPRESSION")) {
         char *str = var_read_string(pb, size);
         if (!str)
@@ -249,6 +269,11 @@ static int read_table(AVFormatContext *avctx, AVStream *st,
     avio_skip(pb, 4);
     count = avio_rb32(pb);
     avio_skip(pb, 4);
+    /* count and each entry size come from the file; bound both before use. */
+    if (count > MV_MAX_TABLE_ENTRIES) {
+        av_log(avctx, AV_LOG_ERROR, "table entry count %u is invalid\n", count);
+        return AVERROR_INVALIDDATA;
+    }
     for (i = 0; i < count; i++) {
         char name[17];
         int size;
@@ -260,7 +285,7 @@ static int read_table(AVFormatContext *avctx, AVStream *st,
             return AVERROR_INVALIDDATA;
         name[sizeof(name) - 1] = 0;
         size = avio_rb32(pb);
-        if (size < 0) {
+        if (size < 0 || size > MV_MAX_VAR_SIZE) {
             av_log(avctx, AV_LOG_ERROR, "entry size %d is invalid\n", size);
             return AVERROR_INVALIDDATA;
         }
@@ -272,23 +297,41 @@ static int read_table(AVFormatContext *avctx, AVStream *st,
     return 0;
 }
 
-static void read_index(AVIOContext *pb, AVStream *st)
+static int read_index(AVFormatContext *avctx, AVIOContext *pb, AVStream *st)
 {
     uint64_t timestamp = 0;
     int i;
+
+    if (st->nb_frames <= 0 || st->nb_frames > MV_MAX_FRAMES) {
+        av_log(avctx, AV_LOG_ERROR, "frame count %"PRId64" is invalid\n",
+               st->nb_frames);
+        return AVERROR_INVALIDDATA;
+    }
+
     for (i = 0; i < st->nb_frames; i++) {
         uint32_t pos  = avio_rb32(pb);
         uint32_t size = avio_rb32(pb);
         avio_skip(pb, 8);
         if (avio_feof(pb))
-            return ;
-        av_add_index_entry(st, pos, timestamp, size, 0, AVINDEX_KEYFRAME);
+            return AVERROR_INVALIDDATA;
+        /* size is input-derived and later used for packet allocation. */
+        if (size > MV_MAX_PACKET_SIZE) {
+            av_log(avctx, AV_LOG_ERROR, "index packet size %"PRIu32" is invalid\n",
+                   size);
+            return AVERROR_INVALIDDATA;
+        }
+        if (av_add_index_entry(st, pos, timestamp, size, 0, AVINDEX_KEYFRAME) < 0)
+            return AVERROR(ENOMEM);
         if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-            timestamp += size / (st->codecpar->ch_layout.nb_channels * 2LL);
+            int channels = st->codecpar->ch_layout.nb_channels;
+            if (channels <= 0)
+                return AVERROR_INVALIDDATA;
+            timestamp += size / (channels * 2LL);
         } else {
             timestamp++;
         }
     }
+    return 0;
 }
 
 static int mv_read_header(AVFormatContext *avctx)
@@ -332,6 +375,12 @@ static int mv_read_header(AVFormatContext *avctx)
         vst->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
         vst->avg_frame_rate = fps;
         vst->duration = vst->nb_frames = avio_rb32(pb);
+        /* nb_frames is input-derived and used to size the index loop. */
+        if (vst->nb_frames <= 0 || vst->nb_frames > MV_MAX_FRAMES) {
+            av_log(avctx, AV_LOG_ERROR, "frame count %"PRId64" is invalid\n",
+                   vst->nb_frames);
+            return AVERROR_INVALIDDATA;
+        }
         v = avio_rb32(pb);
         switch (v) {
         case 1:
@@ -348,6 +397,9 @@ static int mv_read_header(AVFormatContext *avctx)
         vst->codecpar->codec_tag = 0;
         vst->codecpar->width     = avio_rb32(pb);
         vst->codecpar->height    = avio_rb32(pb);
+        if (av_image_check_size(vst->codecpar->width, vst->codecpar->height,
+                                0, avctx) < 0)
+            return AVERROR_INVALIDDATA;
         avio_skip(pb, 12);
 
         if (ast) {
@@ -401,11 +453,23 @@ static int mv_read_header(AVFormatContext *avctx)
             if (avio_feof(pb))
                 return AVERROR_INVALIDDATA;
             avio_skip(pb, 8);
-            if (ast) {
-                av_add_index_entry(ast, pos, timestamp, asize, 0, AVINDEX_KEYFRAME);
-                timestamp += asize / (ast->codecpar->ch_layout.nb_channels * (uint64_t)bytes_per_sample);
+            /* asize/vsize come from the file and feed av_get_packet later. */
+            if (asize > MV_MAX_PACKET_SIZE || vsize > MV_MAX_PACKET_SIZE) {
+                av_log(avctx, AV_LOG_ERROR,
+                       "index packet size asize=%"PRIu32" vsize=%"PRIu32" is invalid\n",
+                       asize, vsize);
+                return AVERROR_INVALIDDATA;
             }
-            av_add_index_entry(vst, pos + asize, i, vsize, 0, AVINDEX_KEYFRAME);
+            if (ast) {
+                if (av_add_index_entry(ast, pos, timestamp, asize, 0,
+                                       AVINDEX_KEYFRAME) < 0)
+                    return AVERROR(ENOMEM);
+                timestamp += asize / (ast->codecpar->ch_layout.nb_channels *
+                                      (uint64_t)bytes_per_sample);
+            }
+            if (av_add_index_entry(vst, pos + asize, i, vsize, 0,
+                                   AVINDEX_KEYFRAME) < 0)
+                return AVERROR(ENOMEM);
         }
     } else if (!version && avio_rb16(pb) == 3) {
         avio_skip(pb, 4);
@@ -456,13 +520,20 @@ static int mv_read_header(AVFormatContext *avctx)
             vst->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
             if ((ret = read_table(avctx, vst, parse_video_var))<0)
                 return ret;
+            if (av_image_check_size(vst->codecpar->width, vst->codecpar->height,
+                                    0, avctx) < 0)
+                return AVERROR_INVALIDDATA;
         }
 
-        if (mv->nb_audio_tracks)
-            read_index(pb, ast);
+        if (mv->nb_audio_tracks) {
+            if ((ret = read_index(avctx, pb, ast)) < 0)
+                return ret;
+        }
 
-        if (mv->nb_video_tracks)
-            read_index(pb, vst);
+        if (mv->nb_video_tracks) {
+            if ((ret = read_index(avctx, pb, vst)) < 0)
+                return ret;
+        }
     } else {
         avpriv_request_sample(avctx, "Version %i", version);
         return AVERROR_PATCHWELCOME;
